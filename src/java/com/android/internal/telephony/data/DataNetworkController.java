@@ -551,6 +551,15 @@ public class DataNetworkController extends Handler {
          */
         public void onInternetDataNetworkConnected(@NonNull List<DataProfile> dataProfiles) {}
 
+        /**
+         * Called when data network is connected.
+         *
+         * @param transport Transport for the connected network.
+         * @param dataProfile The data profile of the connected data network.
+         */
+        public void onDataNetworkConnected(@TransportType int transport,
+                @NonNull DataProfile dataProfile) {}
+
         /** Called when internet data network is disconnected. */
         public void onInternetDataNetworkDisconnected() {}
 
@@ -1426,7 +1435,7 @@ public class DataNetworkController extends Handler {
         if (networkRequest.hasCapability(NetworkCapabilities.NET_CAPABILITY_EIMS)) {
             evaluation.addDataAllowedReason(DataAllowedReason.EMERGENCY_REQUEST);
             evaluation.setCandidateDataProfile(mDataProfileManager.getDataProfileForNetworkRequest(
-                    networkRequest, getDataNetworkType(transport)));
+                    networkRequest, getDataNetworkType(transport), true));
             networkRequest.setEvaluation(evaluation);
             log(evaluation.toString());
             return evaluation;
@@ -1568,7 +1577,10 @@ public class DataNetworkController extends Handler {
 
         // Check if there is any compatible data profile
         DataProfile dataProfile = mDataProfileManager
-                .getDataProfileForNetworkRequest(networkRequest, getDataNetworkType(transport));
+                .getDataProfileForNetworkRequest(networkRequest, getDataNetworkType(transport),
+                        // If the evaluation is due to environmental changes, then we should ignore
+                        // the permanent failure reached earlier.
+                        reason.isConditionBased());
         if (dataProfile == null) {
             evaluation.addDataDisallowedReason(DataDisallowedReason.NO_SUITABLE_DATA_PROFILE);
         } else if (reason == DataEvaluationReason.NEW_REQUEST
@@ -1716,7 +1728,8 @@ public class DataNetworkController extends Handler {
                     if (nri != null) {
                         DataSpecificRegistrationInfo dsri = nri.getDataSpecificInfo();
                         if (dsri != null && dsri.getVopsSupportInfo() != null
-                                && !dsri.getVopsSupportInfo().isVopsSupported()) {
+                                && !dsri.getVopsSupportInfo().isVopsSupported()
+                                && !mDataConfigManager.shouldKeepNetworkUpInNonVops()) {
                             evaluation.addDataDisallowedReason(
                                     DataDisallowedReason.VOPS_NOT_SUPPORTED);
                         }
@@ -1877,7 +1890,8 @@ public class DataNetworkController extends Handler {
                     DataSpecificRegistrationInfo dsri = nri.getDataSpecificInfo();
                     // Check if the network is non-VoPS.
                     if (dsri != null && dsri.getVopsSupportInfo() != null
-                            && !dsri.getVopsSupportInfo().isVopsSupported()) {
+                            && !dsri.getVopsSupportInfo().isVopsSupported()
+                            && !mDataConfigManager.shouldKeepNetworkUpInNonVops()) {
                         dataEvaluation.addDataDisallowedReason(
                                 DataDisallowedReason.VOPS_NOT_SUPPORTED);
                     }
@@ -2282,8 +2296,7 @@ public class DataNetworkController extends Handler {
                 + "carrier specific. mSimState="
                 + SubscriptionInfoUpdater.simStateString(mSimState));
         updateNetworkRequestsPriority();
-        sendMessage(obtainMessage(EVENT_REEVALUATE_UNSATISFIED_NETWORK_REQUESTS,
-                DataEvaluationReason.DATA_CONFIG_CHANGED));
+        onReevaluateUnsatisfiedNetworkRequests(DataEvaluationReason.DATA_CONFIG_CHANGED);
     }
 
     /**
@@ -2366,9 +2379,12 @@ public class DataNetworkController extends Handler {
                 + dataSetupRetryEntry + ", allowed reason=" + allowedReason + ", service state="
                 + mServiceState);
         for (DataNetwork dataNetwork : mDataNetworkList) {
-            if (dataNetwork.getDataProfile().equals(dataProfile)) {
+            DataProfile currentDataProfile = dataNetwork.getDataProfile();
+            if (dataProfile.equals(currentDataProfile)
+                    || mDataProfileManager.areDataProfilesSharingApn(
+                            dataProfile, currentDataProfile)) {
                 log("onSetupDataNetwork: Found existing data network " + dataNetwork
-                        + " has the same data profile.");
+                        + " using the same or a similar data profile.");
                 if (dataSetupRetryEntry != null) {
                     dataSetupRetryEntry.setState(DataRetryEntry.RETRY_STATE_CANCELLED);
                 }
@@ -2580,6 +2596,11 @@ public class DataNetworkController extends Handler {
      */
     private void onDataNetworkConnected(@NonNull DataNetwork dataNetwork) {
         logl("onDataNetworkConnected: " + dataNetwork);
+
+        mDataNetworkControllerCallbacks.forEach(callback -> callback.invokeFromExecutor(
+                () -> callback.onDataNetworkConnected(dataNetwork.getTransport(),
+                        dataNetwork.getDataProfile())));
+
         mPreviousConnectedDataNetworkList.add(0, dataNetwork);
         // Preserve the connected data networks for debugging purposes.
         if (mPreviousConnectedDataNetworkList.size() > MAX_HISTORICAL_CONNECTED_DATA_NETWORKS) {
@@ -2852,6 +2873,16 @@ public class DataNetworkController extends Handler {
         } else if (handoverFailureMode == DataCallResponse
                 .HANDOVER_FAILURE_MODE_NO_FALLBACK_RETRY_SETUP_NORMAL || handoverFailureMode
                 == DataCallResponse.HANDOVER_FAILURE_MODE_LEGACY) {
+            int preferredTransport = mAccessNetworksManager
+                    .getPreferredTransportByNetworkCapability(
+                            dataNetwork.getApnTypeNetworkCapability());
+            if (dataNetwork.getTransport() == preferredTransport) {
+                log("onDataNetworkHandoverFailed: Already on preferred transport "
+                        + AccessNetworkConstants.transportTypeToString(preferredTransport)
+                        + ". No further actions needed.");
+                return;
+            }
+
             int targetTransport = DataUtils.getTargetTransport(dataNetwork.getTransport());
             mDataRetryManager.evaluateDataSetupRetry(dataNetwork.getDataProfile(), targetTransport,
                     dataNetwork.getAttachedNetworkRequestList(), cause, retryDelayMillis);
